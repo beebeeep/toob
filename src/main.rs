@@ -1,6 +1,5 @@
 mod binary;
-mod errors;
-mod request_api;
+mod kafka;
 
 use glommio::{
     LocalExecutor, LocalExecutorBuilder,
@@ -15,12 +14,11 @@ use anyhow::{Context, anyhow};
 use binary::*;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use bytes_varint::VarIntSupportMut;
-use errors::KafkaError;
-use request_api::RequestApi;
+use kafka::api;
 
 #[derive(Debug)]
 struct KafkaRequestHeaderV2 {
-    request: RequestApi,
+    request: api::Request,
     version: i16,
     correlation_id: i32,
     client: Option<String>,
@@ -78,7 +76,7 @@ async fn process_request(stream: &mut TcpStream) -> anyhow::Result<()> {
 
 fn parse_request_header(mut buf: &[u8]) -> anyhow::Result<KafkaRequestHeaderV2> {
     let request = KafkaRequestHeaderV2 {
-        request: RequestApi::from(buf.try_get_i16().context("api key")?),
+        request: api::Request::from(buf.try_get_i16().context("api key")?),
         version: buf.try_get_i16().context("api version")?,
         correlation_id: buf.try_get_i32().context("correlation ID")?,
         client: read_nullable_string(buf).context("client name")?,
@@ -110,7 +108,7 @@ fn process_kafka_request(req: KafkaRequestHeaderV2, mut buf: &[u8]) -> anyhow::R
     let mut header = BytesMut::with_capacity(4 + 4);
 
     let body = match req.request {
-        RequestApi::ApiVersions => {
+        api::Request::ApiVersions => {
             kafka_ApiVersions(&req, &mut buf).context("handling ApiVersions")?
         }
         _ => {
@@ -132,7 +130,7 @@ fn kafka_ApiVersions(
 ) -> anyhow::Result<BytesMut> {
     let mut resp = BytesMut::with_capacity(64);
     if req_header.version > 4 {
-        resp.put_i16(KafkaError::UnsupportedVersion.into());
+        resp.put_i16(api::Error::UnsupportedVersion.into());
         resp.put_i32_varint(0); // empty array
         resp.put_i32(0); // throttle time
         resp.put_u8(0); // no tags
@@ -150,9 +148,9 @@ fn kafka_ApiVersions(
         req_header.version
     );
 
-    resp.put_i16(KafkaError::None.into()); // no error
+    resp.put_i16(api::Error::None.into()); // no error
     resp.put_i32_varint(2); // array of size 1
-    resp.put_i16(RequestApi::ApiVersions.into());
+    resp.put_i16(api::Request::ApiVersions.into());
     resp.put_i16(4); // min version
     resp.put_i16(4); // max version
     resp.put_u8(0); // no tags
