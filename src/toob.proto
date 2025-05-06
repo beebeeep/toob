@@ -1,0 +1,53 @@
+syntax = "proto3";
+import "google/protobuf/timestamp.proto";
+
+package toob;
+
+enum Request {
+  Noop = 0;
+  Produce = 1;
+  Consume = 2;
+}
+
+enum Error {
+  None = 0;
+  ProduceError = 1;
+}
+
+message Message {
+  google.protobuf.Timestamp timestamp = 1;
+  map<string, bytes> metadata = 2;
+  bytes key = 3;
+  bytes value = 4;
+}
+  
+// Header is sent before each request and identifies its type
+message Header {
+  Request request = 1;
+}
+
+
+// == Producing ==
+message ProduceRequest {
+  string Topic = 1;
+  int32 Parition = 2;
+  int32 BatchSize = 3;
+}
+// Client now sends messages, total BatchSize messages
+message ProduceResponse {
+  Error error = 1;
+}
+
+// == Consuming ==
+message ConsumeRequest {
+  string Topic = 1;
+  int32 Partition = 2;
+  int64 StartOffset = 3;
+  optional int32 MaxMessages = 4;
+}
+message ConsumeResponse {
+  Error error = 1;
+}
+// Server now streams messages, up to MaxMessages, or ifinitely if MaxMessages is not specified
+
+
