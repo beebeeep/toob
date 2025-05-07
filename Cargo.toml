@@ -10,6 +10,15 @@ bytes-varint = "1.1.0"
 futures-lite = "2.6.0"
 glommio = "0.9.0"
 prost = "0.13.5"
+prost-types = "0.13.5"
 
 [build-dependencies]
 prost-build = "0.13.5"
+
+[[bin]]
+name = "server"
+path = "src/bin/server/main.rs"
+
+[[bin]]
+name = "client"
+path = "src/bin/client/main.rs"

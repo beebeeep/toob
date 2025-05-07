@@ -825,6 +825,7 @@ dependencies = [
  "glommio",
  "prost",
  "prost-build",
+ "prost-types",
 ]
 
 [[package]]
