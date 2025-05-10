@@ -16,21 +16,22 @@ enum Error {
 
 message Message {
   google.protobuf.Timestamp timestamp = 1;
-  map<string, bytes> metadata = 2;
-  bytes key = 3;
-  bytes value = 4;
+  bytes value = 2;
+  optional bytes key = 3;
+  map<string, bytes> metadata = 4;
 }
   
 // Header is sent before each request and identifies its type
 message Header {
-  Request request = 1;
+  Request request_id = 1;
+  bytes request = 2; // nested protobuf message containing the specific API request
 }
 
 
 // == Producing ==
 message ProduceRequest {
   string Topic = 1;
-  int32 Parition = 2;
+  int32 Partition = 2;
   int32 BatchSize = 3;
 }
 // Client now sends messages, total BatchSize messages
