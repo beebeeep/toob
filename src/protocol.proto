@@ -31,8 +31,8 @@ message Header {
 // == Producing ==
 message ProduceRequest {
   string Topic = 1;
-  int32 Partition = 2;
-  int32 BatchSize = 3;
+  uint32 Partition = 2;
+  uint32 BatchSize = 3;
 }
 // Client now sends messages, total BatchSize messages
 message ProduceResponse {
@@ -42,8 +42,8 @@ message ProduceResponse {
 // == Consuming ==
 message ConsumeRequest {
   string Topic = 1;
-  int32 Partition = 2;
-  int64 StartOffset = 3;
+  uint32 Partition = 2;
+  uint64 StartOffset = 3;
   optional int32 MaxMessages = 4;
 }
 message ConsumeResponse {
