@@ -1,23 +1,30 @@
-use std::any::Any;
 use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow};
 use bytes::{Buf, BytesMut};
-use futures_lite::{AsyncRead, AsyncReadExt, AsyncWriteExt, StreamExt};
+use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use glommio::{
-    ByteSliceExt,
-    io::{BufferedFile, DmaStreamWriterBuilder, OpenOptions, ReadResult},
+    io::{BufferedFile, OpenOptions, ReadResult},
     net::TcpStream,
 };
 use prost::Message;
 use std::collections::{BTreeMap, HashMap};
+use thiserror::Error;
 
 use crate::pb;
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("topic/partition not found")]
+    TopicPartitionNotFound,
+    #[error("offset not found")]
+    OffsetNotFound,
+}
 
 type TopicPartition = (String, u32);
 struct MessageMeta {
     file_offset: u64,
-    size: u64,
+    size: usize,
 }
 
 #[derive(Clone)]
@@ -94,13 +101,7 @@ impl Server {
                 let mut size = prost::decode_length_delimiter(nibble.as_ref())
                     .context("decoding message length")?;
                 size += prost::length_delimiter_len(size); // include length delimiter itself
-                idx.insert(
-                    offset,
-                    MessageMeta {
-                        file_offset,
-                        size: size as u64,
-                    },
-                );
+                idx.insert(offset, MessageMeta { file_offset, size });
                 eprintln!(
                     "indexed message of {size} bytes with offset {offset} at file offset {file_offset}"
                 );
@@ -140,16 +141,29 @@ impl Server {
         Ok(())
     }
 
-    async fn req_consume(&self, req: impl Buf, stream: impl AsyncRead) -> Result<()> {
+    async fn req_consume(
+        &self,
+        req: impl Buf,
+        mut stream: impl AsyncRead + AsyncWrite + Unpin,
+    ) -> Result<()> {
         let req = pb::ConsumeRequest::decode_length_delimited(req).context("decoding request")?;
         eprintln!("got req {req:?}");
-        let f = match self.partition_files.get(&(req.topic, req.partition)) {
-            Some(f) => f,
-            None => return Err(anyhow!("no such topic/partition")),
-        };
         let mut msg_count = 0;
+        let id = (req.topic, req.partition);
         loop {
-            // let msg = self.read_delimited_message(f).await.context("reading message from disk")?
+            let msg = self
+                .read_message_at_offset(&id, req.start_offset + msg_count)
+                .await?;
+            stream
+                .write(msg.as_ref())
+                .await
+                .context("writing message to stream")?;
+            msg_count += 1;
+            if let Some(max) = req.max_messages {
+                if msg_count > max {
+                    break;
+                }
+            }
         }
         Ok(())
     }
@@ -178,12 +192,21 @@ impl Server {
         Ok(())
     }
 
-    async fn read_message_at_offset(&self, id: &TopicPartition) -> Result<ReadResult> {
-        let file_offset = match self.offset_index.get(id) {
-            Some(v) => todo!(),
-            None => return Err(anyhow!("no message at this offset")),
-        };
-        todo!();
+    async fn read_message_at_offset(&self, id: &TopicPartition, offset: u64) -> Result<ReadResult> {
+        let meta = self
+            .offset_index
+            .get(id)
+            .ok_or(Error::TopicPartitionNotFound)?
+            .get(&offset)
+            .ok_or(Error::OffsetNotFound)?;
+        let f = self
+            .partition_files
+            .get(id)
+            .ok_or(Error::TopicPartitionNotFound)?;
+
+        f.read_at(meta.file_offset, meta.size as usize)
+            .await
+            .map_err(|e| anyhow!("reading partition: {e}"))
     }
 
     async fn read_delimited_message(&self, mut stream: impl AsyncRead + Unpin) -> Result<Vec<u8>> {

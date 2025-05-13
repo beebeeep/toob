@@ -44,7 +44,7 @@ message ConsumeRequest {
   string Topic = 1;
   uint32 Partition = 2;
   uint64 StartOffset = 3;
-  optional int32 MaxMessages = 4;
+  optional uint64 MaxMessages = 4;
 }
 message ConsumeResponse {
   Error error = 1;
