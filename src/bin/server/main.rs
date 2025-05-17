@@ -5,16 +5,21 @@ use toob::node::server;
 use std::io;
 
 async fn server(srv: server::Server) -> Result<(), io::Error> {
-    let listener = TcpListener::bind("127.0.0.1:8137")?;
+    let listener = TcpListener::bind("localhost:8137")?;
     let mut incoming = listener.incoming();
     while let Some(stream) = incoming.next().await {
         match stream {
             Ok(mut stream) => {
                 let srv = srv.clone();
                 spawn_local(async move {
-                    match srv.process_request(&mut stream).await {
-                        Ok(_) => {}
-                        Err(e) => eprintln!("error processing request: {e:#}"),
+                    loop {
+                        match srv.process_request(&mut stream).await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("error processing request: {e:#}");
+                                break;
+                            }
+                        }
                     }
                 })
                 .detach();
@@ -28,7 +33,7 @@ async fn server(srv: server::Server) -> Result<(), io::Error> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cpus = CpuSet::online().unwrap();
 
-    let network_listeners = LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(4, Some(cpus)))
+    let network_listeners = LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(1, Some(cpus)))
         .on_all_shards(|| async move {
             println!("starting executor {}", glommio::executor().id());
             let srv = server::Server::new("./log_dir").await.unwrap();

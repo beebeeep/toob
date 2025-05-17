@@ -1,17 +1,49 @@
 use bytes::{Buf, BytesMut};
+use clap::{Arg, Command};
+use futures_lite::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use glommio::{LocalExecutor, io::stdin, net::TcpStream};
 use prost::Message;
 use std::{
     collections::HashMap,
-    io::{self, Write},
-    net::TcpStream,
     time::{SystemTime, UNIX_EPOCH},
 };
-use toob::pb;
+use toob::{pb, util};
 
 fn main() {
-    let mut stream = TcpStream::connect("localhost:8137").unwrap();
-    io::stdin().lines().for_each(|line| {
-        let line = line.unwrap();
+    let matches = Command::new("toob client")
+        .args([
+            Arg::new("producer")
+                .short('p')
+                .help("start producer")
+                .action(clap::ArgAction::SetTrue),
+            Arg::new("consumer")
+                .short('c')
+                .help("start consumer")
+                .action(clap::ArgAction::SetTrue),
+        ])
+        .get_matches();
+    let producer = matches.get_flag("producer");
+    let consumer = matches.get_flag("consumer");
+    let ex = LocalExecutor::default();
+    ex.run(async {
+        if producer {
+            start_producer().await
+        }
+        if consumer {
+            start_consumer().await
+        }
+    });
+}
+
+async fn start_producer() {
+    let mut stream = TcpStream::connect("localhost:8137").await.unwrap();
+    let input = std::io::stdin();
+    loop {
+        let mut line = String::new();
+        if input.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        println!("read {} bytes", line.len());
         let req = pb::ProduceRequest {
             topic: "test_topic".to_string(),
             partition: 0,
@@ -36,7 +68,34 @@ fn main() {
 
         buf.truncate(0);
         header.encode_length_delimited(&mut buf).unwrap();
+        eprintln!("wrote header, len {} bytes: {:?}", buf.len(), buf);
         msg.encode_length_delimited(&mut buf).unwrap();
-        stream.write(&buf).unwrap();
-    });
+        stream.write(&buf).await.unwrap();
+        // println!("{line}");
+    }
+}
+
+async fn start_consumer() {
+    let mut stream = TcpStream::connect("localhost:8137").await.unwrap();
+    let req = pb::ConsumeRequest {
+        topic: "test_topic".to_string(),
+        partition: 0,
+        start_offset: 0,
+        max_messages: Some(1),
+    };
+    let mut buf = BytesMut::with_capacity(128);
+    req.encode_length_delimited(&mut buf).unwrap();
+    let header = pb::Header {
+        request_id: pb::Request::Consume as i32,
+        request: buf.to_vec(),
+    };
+    buf.truncate(0);
+    header.encode_length_delimited(&mut buf).unwrap();
+    stream.write(&buf).await.unwrap();
+    loop {
+        let msg = util::read_delimited_message(&mut stream).await.unwrap();
+        eprintln!("read response {} bytes", msg.len());
+        let msg = pb::Message::decode_length_delimited(msg.as_ref()).unwrap();
+        println!("got message: {msg:?}");
+    }
 }
