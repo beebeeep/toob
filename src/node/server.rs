@@ -1,12 +1,13 @@
-use std::{cell::RefCell, ops::Deref, rc::Rc};
+use anyhow::{Context, anyhow};
+use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use crate::{pb, util};
-use anyhow::{Context, Result, anyhow};
-use bytes::{Buf, BufMut, BytesMut};
-use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use bytes::Buf;
+use futures_lite::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use glommio::{
     io::{BufferedFile, OpenOptions, ReadResult},
     net::TcpStream,
+    timer::sleep,
 };
 use prost::Message;
 use std::collections::{BTreeMap, HashMap};
@@ -14,10 +15,14 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("topic/partition not found")]
-    TopicPartitionNotFound,
+    #[error("topic/partition {0:?} not found")]
+    TopicPartitionNotFound(TopicPartition),
     #[error("offset not found")]
     OffsetNotFound,
+    #[error("IO error")]
+    IOError(#[from] std::io::Error),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error), // TODO wrap glommio errs somehow?
 }
 
 type TopicPartition = (String, u32);
@@ -35,7 +40,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub async fn new(log_dir: &str) -> Result<Self> {
+    pub async fn new(log_dir: &str) -> anyhow::Result<Self> {
         // discover and open all partition files
         let mut files = HashMap::new();
         for topic_entry in std::fs::read_dir(log_dir).context("reading log dir")? {
@@ -107,7 +112,7 @@ impl Server {
                     "indexed message of {size} bytes with offset {offset} at file offset {file_offset}"
                 );
                 offset += 1;
-                file_offset += size as u64 + 1;
+                file_offset += size as u64;
             }
 
             offset_index.insert(topic_partition.clone(), idx);
@@ -119,7 +124,7 @@ impl Server {
         })
     }
 
-    pub async fn process_request(&self, mut stream: &mut TcpStream) -> Result<()> {
+    pub async fn process_request(&self, mut stream: &mut TcpStream) -> Result<(), Error> {
         // incoming request starts with Header protobuf message prepended with varint-encoded length
         let header = util::read_delimited_message(&mut stream)
             .await
@@ -148,15 +153,28 @@ impl Server {
         &self,
         req: impl Buf,
         mut stream: impl AsyncRead + AsyncWrite + Unpin,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         let req = pb::ConsumeRequest::decode_length_delimited(req).context("decoding request")?;
         eprintln!("got req {req:?}");
         let mut msg_count = 0;
         let id = (req.topic, req.partition);
         loop {
-            let msg = self
+            let msg = match self
                 .read_message_at_offset(&id, req.start_offset + msg_count)
-                .await?;
+                .await
+            {
+                Ok(msg) => msg,
+                Err(Error::OffsetNotFound) => {
+                    // no messages, wait a bit
+                    // TODO: this shall be signalled somehow from producer?
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                Err(e) => {
+                    println!("nope");
+                    return Err(e);
+                }
+            };
             stream
                 .write(msg.as_ref())
                 .await
@@ -172,13 +190,17 @@ impl Server {
         Ok(())
     }
 
-    async fn req_produce(&self, req: impl Buf, mut stream: impl AsyncRead + Unpin) -> Result<()> {
+    async fn req_produce(
+        &self,
+        req: impl Buf,
+        mut stream: impl AsyncRead + Unpin,
+    ) -> Result<(), Error> {
         let req = pb::ProduceRequest::decode_length_delimited(req).context("decoding request")?;
         eprintln!("got req {req:?}");
         let id = (req.topic, req.partition); // TODO: writes should be sharded between IO threads to ensure nobody is writing to partition logs concurrently
         let f = match self.partition_files.get(&id) {
             Some(f) => f,
-            None => return Err(anyhow!("no such topic/partition")),
+            None => return Err(Error::TopicPartitionNotFound(id.clone())),
         };
         let mut file_offset = f
             .file_size()
@@ -193,7 +215,7 @@ impl Server {
             let msg_len = msg.len();
             eprintln!("got message: {:?}", msg);
             if let Err(e) = f.write_at(msg, 0).await {
-                return Err(anyhow!("writing message: {e}"));
+                return Err(Error::Other(anyhow!("writing message: {e}")));
             }
             offsets.push(MessageMeta {
                 file_offset,
@@ -202,7 +224,7 @@ impl Server {
             file_offset += msg_len as u64;
         }
         if let Err(e) = f.fdatasync().await {
-            return Err(anyhow!("doing fsync: {e}"));
+            return Err(Error::Other(anyhow!("doing fsync: {e}")));
         }
 
         // update index
@@ -224,22 +246,26 @@ impl Server {
         Ok(())
     }
 
-    async fn read_message_at_offset(&self, id: &TopicPartition, offset: u64) -> Result<ReadResult> {
+    async fn read_message_at_offset(
+        &self,
+        id: &TopicPartition,
+        offset: u64,
+    ) -> Result<ReadResult, Error> {
         let meta = {
             let index = self.offset_index.borrow();
             *index
                 .get(id)
-                .ok_or(Error::TopicPartitionNotFound)?
+                .ok_or(Error::TopicPartitionNotFound(id.clone()))?
                 .get(&offset)
                 .ok_or(Error::OffsetNotFound)?
         };
         let f = self
             .partition_files
             .get(id)
-            .ok_or(Error::TopicPartitionNotFound)?;
+            .ok_or(Error::TopicPartitionNotFound(id.clone()))?;
 
         f.read_at(meta.file_offset, meta.size as usize)
             .await
-            .map_err(|e| anyhow!("reading partition: {e}"))
+            .map_err(|e| Error::Other(anyhow!("reading partition: {e}")))
     }
 }

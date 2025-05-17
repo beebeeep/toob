@@ -1,7 +1,7 @@
-use bytes::{Buf, BytesMut};
+use bytes::BytesMut;
 use clap::{Arg, Command};
-use futures_lite::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use glommio::{LocalExecutor, io::stdin, net::TcpStream};
+use futures_lite::AsyncWriteExt;
+use glommio::{LocalExecutor, net::TcpStream};
 use prost::Message;
 use std::{
     collections::HashMap,
@@ -63,7 +63,7 @@ async fn start_producer() {
             }),
             metadata: HashMap::new(),
             key: None,
-            value: line.encode_to_vec(),
+            value: line.trim().into(),
         };
 
         buf.truncate(0);
@@ -71,7 +71,6 @@ async fn start_producer() {
         eprintln!("wrote header, len {} bytes: {:?}", buf.len(), buf);
         msg.encode_length_delimited(&mut buf).unwrap();
         stream.write(&buf).await.unwrap();
-        // println!("{line}");
     }
 }
 
@@ -81,7 +80,7 @@ async fn start_consumer() {
         topic: "test_topic".to_string(),
         partition: 0,
         start_offset: 0,
-        max_messages: Some(1),
+        max_messages: Some(100),
     };
     let mut buf = BytesMut::with_capacity(128);
     req.encode_length_delimited(&mut buf).unwrap();
@@ -94,8 +93,7 @@ async fn start_consumer() {
     stream.write(&buf).await.unwrap();
     loop {
         let msg = util::read_delimited_message(&mut stream).await.unwrap();
-        eprintln!("read response {} bytes", msg.len());
         let msg = pb::Message::decode_length_delimited(msg.as_ref()).unwrap();
-        println!("got message: {msg:?}");
+        println!("-> {}", String::from_utf8(msg.value).unwrap());
     }
 }
