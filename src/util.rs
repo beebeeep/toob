@@ -1,16 +1,20 @@
-use anyhow::{Context, Result};
+use crate::error;
 use futures_lite::{AsyncRead, AsyncReadExt};
+use snafu::ResultExt;
 
 /// Reads length of message (encoded as varint), then message itself. Returned buffer includes original length header.
-pub async fn read_delimited_message(mut stream: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
+pub async fn read_delimited_message(
+    mut stream: impl AsyncRead + Unpin,
+) -> Result<Vec<u8>, error::Error> {
     let mut buf = Vec::with_capacity(512);
     // each message is prepended with varint (from 1 to 10 bytes) encoding its length
     buf.resize(10, 0);
-    stream
-        .read_exact(&mut buf)
-        .await
-        .context("reading message length")?;
-    let len = prost::decode_length_delimiter(buf.as_ref()).context("decoding message length")?;
+    stream.read_exact(&mut buf).await.context(error::IOSnafu {
+        e: "reading message length",
+    })?;
+    let len = prost::decode_length_delimiter(buf.as_ref()).context(error::DecodeSnafu {
+        e: "decoding message length",
+    })?;
     let delim = prost::length_delimiter_len(len);
 
     // we already read 10 bytes, read the rest
@@ -18,6 +22,8 @@ pub async fn read_delimited_message(mut stream: impl AsyncRead + Unpin) -> Resul
     stream
         .read_exact(&mut buf[10..])
         .await
-        .context("reading message")?;
+        .context(error::IOSnafu {
+            e: "reading message",
+        })?;
     Ok(buf)
 }

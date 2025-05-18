@@ -16,7 +16,7 @@ async fn server(srv: server::Server) -> Result<(), io::Error> {
                         match srv.process_request(&mut stream).await {
                             Ok(_) => {}
                             Err(e) => {
-                                eprintln!("error processing request: {e:#}");
+                                eprintln!("error processing request: {e}");
                                 break;
                             }
                         }
