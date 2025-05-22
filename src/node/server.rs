@@ -5,7 +5,7 @@ use crate::{
     error::{self, Error},
     pb, util,
 };
-use bytes::Buf;
+use bytes::{Buf, BufMut, BytesMut};
 use futures_lite::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use glommio::{
     io::{BufferedFile, OpenOptions, ReadResult},
@@ -33,15 +33,15 @@ impl Server {
     pub async fn new(log_dir: &str) -> Result<Self, Error> {
         // discover and open all partition files
         let mut files = HashMap::new();
-        for topic_entry in std::fs::read_dir(log_dir).context(error::IOSnafu {
+        for topic_entry in std::fs::read_dir(log_dir).context(error::IO {
             e: "reading log dir",
         })? {
-            let topic_dir = topic_entry.context(error::IOSnafu {
+            let topic_dir = topic_entry.context(error::IO {
                 e: "reading topic entry",
             })?;
             if !topic_dir
                 .file_type()
-                .context(error::IOSnafu {
+                .context(error::IO {
                     e: "getting log entry type",
                 })?
                 .is_dir()
@@ -51,14 +51,14 @@ impl Server {
             let topic = topic_dir.file_name().into_string().unwrap();
             let topic_path = std::path::Path::new(log_dir).join(topic_dir.file_name());
 
-            for partition_entry in std::fs::read_dir(&topic_path).context(error::IOSnafu {
+            for partition_entry in std::fs::read_dir(&topic_path).context(error::IO {
                 e: "reading partition dir",
             })? {
-                let partition = partition_entry.context(error::IOSnafu {
+                let partition = partition_entry.context(error::IO {
                     e: "reading partition dir entry",
                 })?;
                 let fname = partition.file_name().into_string().unwrap();
-                let ft = partition.file_type().context(error::IOSnafu {
+                let ft = partition.file_type().context(error::IO {
                     e: "getting partition dir entry type",
                 })?;
                 if !fname.ends_with(".log") || !ft.is_file() {
@@ -77,7 +77,7 @@ impl Server {
                     .append(true)
                     .buffered_open(path)
                     .await
-                    .context(error::GlommioSnafu {
+                    .context(error::Glommio {
                         e: "opening partition file: {e}",
                     })?;
 
@@ -92,22 +92,20 @@ impl Server {
             let mut idx = BTreeMap::new();
             let mut file_offset = 0;
             let mut offset = 0;
-            let file_size = partition.file_size().await.context(error::GlommioSnafu {
+            let file_size = partition.file_size().await.context(error::Glommio {
                 e: "getting partition file size",
             })?;
             while file_offset < file_size {
-                let nibble =
-                    partition
-                        .read_at(file_offset, 10)
-                        .await
-                        .context(error::GlommioSnafu {
-                            e: "reading partition",
-                        })?;
-                let mut size = prost::decode_length_delimiter(nibble.as_ref()).context(
-                    error::DecodeSnafu {
+                let nibble = partition
+                    .read_at(file_offset, 10)
+                    .await
+                    .context(error::Glommio {
+                        e: "reading partition",
+                    })?;
+                let mut size =
+                    prost::decode_length_delimiter(nibble.as_ref()).context(error::Decode {
                         e: "decoding message length",
-                    },
-                )?;
+                    })?;
                 size += prost::length_delimiter_len(size); // include length delimiter itself
                 idx.insert(offset, MessageMeta { file_offset, size });
                 eprintln!(
@@ -126,41 +124,65 @@ impl Server {
         })
     }
 
-    pub async fn process_request(&self, mut stream: &mut TcpStream) -> Result<(), Error> {
-        // incoming request starts with Header protobuf message prepended with varint-encoded length
-        let header = util::read_delimited_message(&mut stream)
+    pub async fn accept(&self, stream: &mut TcpStream) -> Result<(), Error> {
+        let resp = self.process_request(stream).await;
+        let mut buf = BytesMut::with_capacity(64);
+        resp.encode_length_delimited(&mut buf)
+            .whatever_context("encoding response header")?;
+        stream
+            .write(buf.as_ref())
             .await
-            .whatever_context("reading header")?;
-        let header =
-            pb::Header::decode_length_delimited(header.as_ref()).context(error::DecodeSnafu {
-                e: "decoding header",
-            })?;
+            .whatever_context("sending response header")?;
+        Ok(())
+    }
+    pub async fn process_request(&self, mut stream: &mut TcpStream) -> pb::ResponseHeader {
+        // incoming request starts with Header protobuf message prepended with varint-encoded length
+        let header = if let Ok(v) = util::read_delimited_message(&mut stream).await {
+            v
+        } else {
+            return pb::ResponseHeader {
+                error: pb::ErrorCode::InvalidRequest as i32,
+                ..Default::default()
+            };
+        };
+        let header = if let Ok(v) = pb::RequestHeader::decode_length_delimited(header.as_ref()) {
+            v
+        } else {
+            return pb::ResponseHeader {
+                error: pb::ErrorCode::InvalidRequest as i32,
+                ..Default::default()
+            };
+        };
 
         match header.request_id.try_into() {
-            Ok(pb::Request::Consume) => self
-                .req_consume(header.request.as_ref(), stream)
-                .await
-                .whatever_context("handling consume request")?,
-            Ok(pb::Request::Produce) => self
-                .req_produce(header.request.as_ref(), stream)
-                .await
-                .whatever_context("handling produce request")?,
-            Ok(pb::Request::Noop) => {
-                eprintln!("got noop")
-            }
-            Err(e) => eprintln!("unknown api request {e}"),
-        };
-        Ok(())
+            Ok(pb::Request::Consume) => self.req_consume(header.request.as_ref(), stream).await,
+            Ok(pb::Request::Produce) => self.req_produce(header.request.as_ref(), stream).await,
+            Ok(pb::Request::Noop) => pb::ResponseHeader {
+                error: pb::ErrorCode::None as i32,
+                ..Default::default()
+            },
+            Err(_) => pb::ResponseHeader {
+                error: pb::ErrorCode::InvalidRequest as i32,
+                ..Default::default()
+            },
+        }
     }
 
     async fn req_consume(
         &self,
         req: impl Buf,
         mut stream: impl AsyncRead + AsyncWrite + Unpin,
-    ) -> Result<(), Error> {
-        let req = pb::ConsumeRequest::decode_length_delimited(req).context(error::DecodeSnafu {
-            e: "decoding request",
-        })?;
+    ) -> pb::ResponseHeader {
+        let req = match pb::ConsumeRequest::decode_length_delimited(req) {
+            Ok(v) => v,
+            Err(e) => {
+                return pb::ResponseHeader {
+                    error: pb::ErrorCode::InvalidRequest as i32,
+                    error_description: Some(e.to_string()),
+                    response: None,
+                };
+            }
+        };
         eprintln!("got req {req:?}");
         let mut msg_count = 0;
         let id = (req.topic, req.partition);
@@ -177,13 +199,23 @@ impl Server {
                     continue;
                 }
                 Err(e) => {
-                    println!("nope");
-                    return Err(e);
+                    return pb::ResponseHeader {
+                        error: pb::ErrorCode::ProduceError as i32,
+                        error_description: Some(e.to_string()),
+                        response: None,
+                    };
                 }
             };
-            stream.write(msg.as_ref()).await.context(error::IOSnafu {
+
+            if let Err(e) = stream.write(msg.as_ref()).await.context(error::IO {
                 e: "writing message to stream",
-            })?;
+            }) {
+                return pb::ResponseHeader {
+                    error: pb::ErrorCode::ProduceError as i32,
+                    error_description: Some(e.to_string()),
+                    response: None,
+                };
+            }
             eprintln!("wrote message of {} bytes", msg.len());
             msg_count += 1;
             if let Some(max) = req.max_messages {
@@ -192,42 +224,68 @@ impl Server {
                 }
             }
         }
-        Ok(())
+        pb::ResponseHeader {
+            error: pb::ErrorCode::None as i32,
+            ..Default::default()
+        }
     }
 
     async fn req_produce(
         &self,
         req: impl Buf,
         mut stream: impl AsyncRead + Unpin,
-    ) -> Result<(), Error> {
-        let req = pb::ProduceRequest::decode_length_delimited(req).context(error::DecodeSnafu {
-            e: "decoding request",
-        })?;
+    ) -> pb::ResponseHeader {
+        let req = if let Ok(v) = pb::ProduceRequest::decode_length_delimited(req) {
+            v
+        } else {
+            return pb::ResponseHeader {
+                error: pb::ErrorCode::InvalidRequest as i32,
+                ..Default::default()
+            };
+        };
         eprintln!("got req {req:?}");
-        let id = (req.topic, req.partition); // TODO: writes should be sharded between IO threads to ensure nobody is writing to partition logs concurrently
-        let f = match self.partition_files.get(&id) {
-            Some(f) => f,
-            None => {
-                return Err(Error::TopicPartitionNotFound {
-                    topic: id.0,
-                    partition: id.1,
-                });
+        let id = (req.topic, req.partition); // TODO: writes should be sharded between IO threads to ensure nobody is writing to partition logs concurrently 
+        let f = if let Some(f) = self.partition_files.get(&id) {
+            f
+        } else {
+            return pb::ResponseHeader {
+                error: pb::ErrorCode::TopicPartitionNotFound as i32,
+                error_description: Some(format!("topic {} partition {} not found", id.0, id.1)),
+                ..Default::default()
+            };
+        };
+        let mut file_offset = match f.file_size().await {
+            Ok(v) => v,
+            Err(e) => {
+                return pb::ResponseHeader {
+                    error: pb::ErrorCode::ProduceError as i32,
+                    error_description: Some(format!("getting partition size: {e}")),
+                    ..Default::default()
+                };
             }
         };
-        let mut file_offset = f.file_size().await.context(error::GlommioSnafu {
-            e: "getting partition size: {e}",
-        })?;
 
         let mut offsets = Vec::with_capacity(req.batch_size as usize);
         for _ in 0..req.batch_size {
-            let msg = util::read_delimited_message(&mut stream)
-                .await
-                .whatever_context("reading message")?;
+            let msg = match util::read_delimited_message(&mut stream).await {
+                Ok(v) => v,
+                Err(e) => {
+                    return pb::ResponseHeader {
+                        error: pb::ErrorCode::InvalidRequest as i32,
+                        error_description: Some(format!("reading message: {e}")),
+                        ..Default::default()
+                    };
+                }
+            };
             let msg_len = msg.len();
             eprintln!("got message: {:?}", msg);
-            f.write_at(msg, 0).await.context(error::GlommioSnafu {
-                e: "writing message to partition",
-            })?;
+            if let Err(e) = f.write_at(msg, 0).await {
+                return pb::ResponseHeader {
+                    error: pb::ErrorCode::ProduceError as i32,
+                    error_description: Some(format!("writing message to partition: {e}")),
+                    ..Default::default()
+                };
+            }
             offsets.push(MessageMeta {
                 file_offset,
                 size: msg_len,
@@ -235,27 +293,31 @@ impl Server {
             file_offset += msg_len as u64;
         }
 
-        f.fdatasync()
-            .await
-            .context(error::GlommioSnafu { e: "doing fsync" })?;
+        if let Err(e) = f.fdatasync().await {
+            return pb::ResponseHeader {
+                error: pb::ErrorCode::ProduceError as i32,
+                error_description: Some(format!("doing fsync: {e}")),
+                ..Default::default()
+            };
+        }
 
         // update index
+        // nb: we don't do any awaits here, so we won't be interrupted
+        // by new request that will be cloning self.
         {
             let mut offset_index = self.offset_index.borrow_mut();
             let index = offset_index.get_mut(&id).unwrap();
-            let next = match index.last_entry() {
-                Some(x) => *x.key() + 1,
-                None => 0,
-            };
+            let next = index.last_entry().map_or(0, |x| *x.key() + 1);
             offsets.into_iter().enumerate().for_each(|(i, o)| {
                 index.insert(next + i as u64, o);
             });
+
             eprintln!("updated index:");
             for (k, v) in index {
                 eprintln!("{k} => {v:?}");
             }
         }
-        Ok(())
+        todo!()
     }
 
     async fn read_message_at_offset(
@@ -268,6 +330,7 @@ impl Server {
             *index
                 .get(id)
                 .ok_or(Error::TopicPartitionNotFound {
+                    // TODO: use Option instead of returning error here mb?
                     topic: id.0.clone(),
                     partition: id.1,
                 })?
@@ -284,7 +347,7 @@ impl Server {
 
         f.read_at(meta.file_offset, meta.size as usize)
             .await
-            .context(error::GlommioSnafu {
+            .context(error::Glommio {
                 e: "reading partition",
             })
     }

@@ -13,7 +13,7 @@ async fn server(srv: server::Server) -> Result<(), io::Error> {
                 let srv = srv.clone();
                 spawn_local(async move {
                     loop {
-                        match srv.process_request(&mut stream).await {
+                        match srv.accept(&mut stream).await {
                             Ok(_) => {}
                             Err(e) => {
                                 eprintln!("error processing request: {e}");

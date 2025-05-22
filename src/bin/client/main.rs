@@ -51,7 +51,7 @@ async fn start_producer() {
         };
         let mut buf = BytesMut::with_capacity(128);
         req.encode_length_delimited(&mut buf).unwrap();
-        let header = pb::Header {
+        let header = pb::RequestHeader {
             request_id: pb::Request::Produce as i32,
             request: buf.to_vec(),
         };
@@ -84,7 +84,7 @@ async fn start_consumer() {
     };
     let mut buf = BytesMut::with_capacity(128);
     req.encode_length_delimited(&mut buf).unwrap();
-    let header = pb::Header {
+    let header = pb::RequestHeader {
         request_id: pb::Request::Consume as i32,
         request: buf.to_vec(),
     };

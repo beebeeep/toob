@@ -9,21 +9,18 @@ pub async fn read_delimited_message(
     let mut buf = Vec::with_capacity(512);
     // each message is prepended with varint (from 1 to 10 bytes) encoding its length
     buf.resize(10, 0);
-    stream.read_exact(&mut buf).await.context(error::IOSnafu {
+    stream.read_exact(&mut buf).await.context(error::IO {
         e: "reading message length",
     })?;
-    let len = prost::decode_length_delimiter(buf.as_ref()).context(error::DecodeSnafu {
+    let len = prost::decode_length_delimiter(buf.as_ref()).context(error::Decode {
         e: "decoding message length",
     })?;
     let delim = prost::length_delimiter_len(len);
 
     // we already read 10 bytes, read the rest
     buf.resize(len + delim, 0);
-    stream
-        .read_exact(&mut buf[10..])
-        .await
-        .context(error::IOSnafu {
-            e: "reading message",
-        })?;
+    stream.read_exact(&mut buf[10..]).await.context(error::IO {
+        e: "reading message",
+    })?;
     Ok(buf)
 }

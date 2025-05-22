@@ -9,9 +9,12 @@ enum Request {
   Consume = 2;
 }
 
-enum Error {
+enum ErrorCode {
   None = 0;
-  ProduceError = 1;
+  InvalidRequest = 1;
+  TopicPartitionNotFound = 2;
+  ProduceError = 3;
+  FetchError = 4;
 }
 
 message Message {
@@ -21,34 +24,51 @@ message Message {
   map<string, bytes> metadata = 4;
 }
   
-// Header is sent before each request and identifies its type
-message Header {
+// RequestHeader is sent before each request and identifies its type
+message RequestHeader {
   Request request_id = 1;
   bytes request = 2; // nested protobuf message containing the specific API request
 }
 
+// ResponseHeader is always sent from server in response to RequestHeader
+// (not necessarily right after request, depends on specific request)
+message ResponseHeader {
+  ErrorCode error = 1;
+  optional string error_description = 2;
+  optional bytes response = 3; //nested protobuf message containing the specific API response
+}
+
 
 // == Producing ==
+// 1. client starts with RequestHeader containing ProduceRequest:
 message ProduceRequest {
-  string Topic = 1;
-  uint32 Partition = 2;
-  uint32 BatchSize = 3;
+  string topic = 1;
+  uint32 partition = 2;
+  uint32 batch_size = 3;
 }
-// Client now sends messages, total BatchSize messages
+
+// 2. client now sends messages, as length-delimited Message protobufs, total BatchSize messages
+
+// 3. Once server read BatchSize messages, it replies with ResponseHeader with ProduceResponse:
 message ProduceResponse {
-  Error error = 1;
+  uint64 first_offset = 1; // offset of first message in the batch
 }
 
 // == Consuming ==
+// 1. client starts with RequestsHeader containing ConsumeRequest:
 message ConsumeRequest {
-  string Topic = 1;
-  uint32 Partition = 2;
-  uint64 StartOffset = 3;
-  optional uint64 MaxMessages = 4;
+  string topic = 1;
+  uint32 partition = 2;
+  uint64 start_offset = 3;
+  optional uint64 max_messages = 4;
 }
+
+
+// 2. server replies with ResponseHeader containing ConsumeResponse:
 message ConsumeResponse {
-  Error error = 1;
+  uint64 first_offset = 1;  // offset of first message in the batch
 }
-// Server now streams messages, up to MaxMessages, or ifinitely if MaxMessages is not specified
+
+// 3. Server now streams messages, up to MaxMessages, or infinitely if MaxMessages is not specified
 
 
