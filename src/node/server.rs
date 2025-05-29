@@ -264,6 +264,7 @@ impl Server {
                 };
             }
         };
+        let first_offset = file_offset;
 
         let mut offsets = Vec::with_capacity(req.batch_size as usize);
         for _ in 0..req.batch_size {
@@ -317,7 +318,20 @@ impl Server {
                 eprintln!("{k} => {v:?}");
             }
         }
-        todo!()
+
+        let mut buf = Vec::with_capacity(8);
+        match (pb::ProduceResponse { first_offset }).encode_length_delimited(&mut buf) {
+            Ok(_) => pb::ResponseHeader {
+                error: pb::ErrorCode::None as i32,
+                error_description: None,
+                response: Some(buf),
+            },
+            Err(e) => pb::ResponseHeader {
+                error: pb::ErrorCode::ProduceError as i32,
+                error_description: Some(format!("encoding result: {e}")),
+                ..Default::default()
+            },
+        }
     }
 
     async fn read_message_at_offset(
