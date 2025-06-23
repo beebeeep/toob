@@ -3,7 +3,7 @@ use snafu::prelude::*;
 use crate::pb;
 
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
+#[snafu(visibility(pub))]
 pub enum Error {
     #[snafu(
         display("topic/partition {topic}/{partition} not found"),

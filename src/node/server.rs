@@ -244,6 +244,11 @@ impl Server {
             };
         };
         eprintln!("got req {req:?}");
+        // TODO: there should be single worker per each partition accepting writes via mpsc channel.
+        // Perhaps it is possible to preallocate disk space in log file and have a dispatcher reserving ranges in file so that we can write to the partition concurrently,
+        // but it'll be kinda hard in terms of error handling. Besides, we partition the topics exactly as a way to parallelize IO,
+        // It doesn't seem reasonable to drop the notion of partitions, because apart for parallelism they are also useful for providing ordering semantics.
+
         let id = (req.topic, req.partition); // TODO: writes should be sharded between IO threads to ensure nobody is writing to partition logs concurrently 
         let f = if let Some(f) = self.partition_files.get(&id) {
             f
