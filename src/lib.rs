@@ -5,7 +5,7 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/toob.protocol.rs"));
 }
 
-#[derive(Clone, Hash, Debug)]
+#[derive(Clone, Hash, Debug, Eq, PartialEq)]
 pub struct TopicPartition {
     pub topic: String,
     pub partition: u32,

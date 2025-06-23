@@ -17,12 +17,6 @@ use std::collections::{BTreeMap, HashMap};
 
 type TopicPartition = (String, u32);
 
-#[derive(Debug, Clone, Copy)]
-struct MessageMeta {
-    file_offset: u64,
-    size: usize,
-}
-
 #[derive(Clone)]
 pub struct Server {
     partition_files: Rc<HashMap<TopicPartition, BufferedFile>>,

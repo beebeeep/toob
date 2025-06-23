@@ -3,26 +3,10 @@ use glommio::{CpuSet, net::TcpListener, prelude::*};
 use snafu::ResultExt;
 use toob::{
     error::{self, Error},
-    node::server,
+    node,
 };
 
 use std::io;
-
-/*
-fn get_f(v: Vec<i32>) -> impl FnOnce() -> () + Send + 'static {
-    move ||  {
-        let v = &v[0..2];
-        println!("ok, {v:?}");
-    }
-}
-fn main() {
-    let v = vec![1,2,3,4,5,6];
-
-    let z = get_f(v.clone());
-    z();
-
-}
-*/
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cpus = CpuSet::online().unwrap();
@@ -45,10 +29,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let t = builder
             .spawn(async move || {
-                let id = glommio::executor().id();
-                for p in thread_parts {
-                    println!("IO thread {id} taking part {p:?}");
-                }
+                let server = node::io::Server::new(thread_parts)
+                    .await
+                    .expect("starting IO thread");
+                server.serve().await.expect("IO thread running");
             })
             .expect("spawning IO thread");
         io_threads.push(t);
@@ -58,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         LocalExecutorPoolBuilder::new(PoolPlacement::MaxSpread(1, Some(net_cpus))).on_all_shards(
             || async move {
                 println!("starting executor {}", glommio::executor().id());
-                let srv = server::Server::new("./log_dir").await.unwrap();
+                let srv = node::network::Server::new("./log_dir").await.unwrap();
                 server(srv).await.expect("failed to start server");
             },
         )?;
@@ -130,7 +114,7 @@ fn discover_partitions(log_dir: &str) -> Result<Vec<(toob::TopicPartition, Strin
     Ok(files)
 }
 
-async fn server(srv: server::Server) -> Result<(), io::Error> {
+async fn server(srv: node::network::Server) -> Result<(), io::Error> {
     let listener = TcpListener::bind("localhost:8137")?;
     let mut incoming = listener.incoming();
     while let Some(stream) = incoming.next().await {
