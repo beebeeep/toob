@@ -1,17 +1,12 @@
+use async_channel::Receiver;
 use snafu::ResultExt;
-use std::{
-    collections::{BTreeMap, HashMap},
-    time::Duration,
-};
+use std::collections::{BTreeMap, HashMap};
 
 use crate::{
-    TopicPartition,
+    IOMessage, IOReply, IORequest, TopicPartition,
     error::{self, Error},
 };
-use glommio::{
-    io::{BufferedFile, OpenOptions},
-    timer,
-};
+use glommio::io::{BufferedFile, OpenOptions};
 
 #[derive(Debug, Clone, Copy)]
 struct MessageMeta {
@@ -22,10 +17,14 @@ struct MessageMeta {
 pub struct Server {
     partition_files: HashMap<TopicPartition, BufferedFile>,
     offset_index: HashMap<TopicPartition, BTreeMap<u64, MessageMeta>>,
+    tx: Receiver<IOMessage>,
 }
 
 impl Server {
-    pub async fn new(partitions: Vec<(TopicPartition, String)>) -> Result<Self, Error> {
+    pub async fn new(
+        partitions: Vec<(TopicPartition, String)>,
+        tx: Receiver<IOMessage>,
+    ) -> Result<Self, Error> {
         let mut partition_files = HashMap::new();
         let mut offset_index = HashMap::new();
 
@@ -76,12 +75,24 @@ impl Server {
         Ok(Self {
             partition_files,
             offset_index,
+            tx,
         })
     }
 
     pub async fn serve(&self) -> Result<(), Error> {
-        loop {
-            timer::sleep(Duration::from_secs(1)).await
+        match self.tx.recv().await.context(error::IORecv)? {
+            (IORequest::Put { tp, data }, resp) => {
+                eprintln!("got PUT to {tp}, {} bytes", data.len());
+                if let Err(e) = resp.send(Ok(IOReply::Put(0))) {
+                    eprintln!("error sending PUT reply: {e}");
+                }
+            }
+            (IORequest::Get { tp, offset }, resp) => {
+                eprintln!("got GET at {tp}/{offset}");
+                if let Err(e) = resp.send(Ok(IOReply::Get(Vec::new()))) {
+                    eprintln!("error sending GET reply: {e}");
+                }
+            }
         }
         Ok(())
     }

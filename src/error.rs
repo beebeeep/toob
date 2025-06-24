@@ -1,3 +1,4 @@
+use async_channel::RecvError;
 use snafu::prelude::*;
 
 use crate::pb;
@@ -26,19 +27,20 @@ pub enum Error {
         source: glommio::GlommioError<()>,
     },
 
-    #[snafu(display("PD decoding error: {e}"), context(suffix(false)))]
+    #[snafu(display("PB decoding error: {e}"), context(suffix(false)))]
     Decode {
         e: String,
         source: prost::DecodeError,
     },
 
-    #[snafu(whatever, display("{message}: {source:?}"))]
-    GenericError {
-        message: String,
-
-        #[snafu(source(from(Box<dyn std::error::Error>, Some)))]
-        source: Option<Box<dyn std::error::Error>>,
+    #[snafu(display("PB encoding error: {e}"), context(suffix(false)))]
+    Encode {
+        e: String,
+        source: prost::EncodeError,
     },
+
+    #[snafu(display("IO thread request"), context(suffix(false)))]
+    IORecv { source: async_channel::RecvError },
 }
 
 impl Into<pb::ErrorCode> for Error {

@@ -1,132 +1,38 @@
-use snafu::ResultExt;
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use async_channel::Sender;
+use snafu::{IntoError, ResultExt};
+use std::{fmt::Debug, time::Duration};
 
 use crate::{
+    IOMessage, TopicPartition,
     error::{self, Error},
     pb, util,
 };
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 use futures_lite::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use glommio::{
-    io::{BufferedFile, OpenOptions, ReadResult},
-    net::TcpStream,
-    timer::sleep,
-};
+use glommio::{io::ReadResult, net::TcpStream, timer::sleep};
 use prost::Message;
-use std::collections::{BTreeMap, HashMap};
-
-type TopicPartition = (String, u32);
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct Server {
-    partition_files: Rc<HashMap<TopicPartition, BufferedFile>>,
-    offset_index: Rc<RefCell<HashMap<TopicPartition, BTreeMap<u64, MessageMeta>>>>,
+    io_chans: HashMap<TopicPartition, Sender<IOMessage>>,
 }
 
 impl Server {
-    pub async fn new(log_dir: &str) -> Result<Self, Error> {
-        // discover and open all partition files
-        let mut files = HashMap::new();
-        for topic_entry in std::fs::read_dir(log_dir).context(error::IO {
-            e: "reading log dir",
-        })? {
-            let topic_dir = topic_entry.context(error::IO {
-                e: "reading topic entry",
-            })?;
-            if !topic_dir
-                .file_type()
-                .context(error::IO {
-                    e: "getting log entry type",
-                })?
-                .is_dir()
-            {
-                continue;
-            }
-            let topic = topic_dir.file_name().into_string().unwrap();
-            let topic_path = std::path::Path::new(log_dir).join(topic_dir.file_name());
-
-            for partition_entry in std::fs::read_dir(&topic_path).context(error::IO {
-                e: "reading partition dir",
-            })? {
-                let partition = partition_entry.context(error::IO {
-                    e: "reading partition dir entry",
-                })?;
-                let fname = partition.file_name().into_string().unwrap();
-                let ft = partition.file_type().context(error::IO {
-                    e: "getting partition dir entry type",
-                })?;
-                if !fname.ends_with(".log") || !ft.is_file() {
-                    continue;
-                }
-                let partition = fname
-                    .strip_suffix(".log")
-                    .unwrap()
-                    .parse()
-                    .whatever_context("wrong partition name")?;
-
-                let path = std::path::Path::new(&topic_path).join(fname);
-                let file = OpenOptions::new()
-                    .write(true)
-                    .read(true)
-                    .append(true)
-                    .buffered_open(path)
-                    .await
-                    .context(error::Glommio {
-                        e: "opening partition file: {e}",
-                    })?;
-
-                files.insert((topic.clone(), partition), file);
-                eprintln!("found topic {topic} partition {partition}");
-            }
-        }
-
-        // now read each partition and build index mapping logical offset to offset in file
-        let mut offset_index = HashMap::new();
-        for (topic_partition, partition) in files.iter() {
-            let mut idx = BTreeMap::new();
-            let mut file_offset = 0;
-            let mut offset = 0;
-            let file_size = partition.file_size().await.context(error::Glommio {
-                e: "getting partition file size",
-            })?;
-            while file_offset < file_size {
-                let nibble = partition
-                    .read_at(file_offset, 10)
-                    .await
-                    .context(error::Glommio {
-                        e: "reading partition",
-                    })?;
-                let mut size =
-                    prost::decode_length_delimiter(nibble.as_ref()).context(error::Decode {
-                        e: "decoding message length",
-                    })?;
-                size += prost::length_delimiter_len(size); // include length delimiter itself
-                idx.insert(offset, MessageMeta { file_offset, size });
-                eprintln!(
-                    "indexed message of {size} bytes with offset {offset} at file offset {file_offset}"
-                );
-                offset += 1;
-                file_offset += size as u64;
-            }
-
-            offset_index.insert(topic_partition.clone(), idx);
-        }
-
-        Ok(Self {
-            partition_files: Rc::new(files),
-            offset_index: Rc::new(RefCell::new(offset_index)),
-        })
+    pub async fn new(io_chans: HashMap<TopicPartition, Sender<IOMessage>>) -> Result<Self, Error> {
+        Ok(Self { io_chans })
     }
 
     pub async fn accept(&self, stream: &mut TcpStream) -> Result<(), Error> {
         let resp = self.process_request(stream).await;
         let mut buf = BytesMut::with_capacity(64);
         resp.encode_length_delimited(&mut buf)
-            .whatever_context("encoding response header")?;
-        stream
-            .write(buf.as_ref())
-            .await
-            .whatever_context("sending response header")?;
+            .context(error::Encode {
+                e: "encoding response",
+            })?;
+        stream.write(buf.as_ref()).await.context(error::IO {
+            e: "sending response header",
+        })?;
         Ok(())
     }
     pub async fn process_request(&self, mut stream: &mut TcpStream) -> pb::ResponseHeader {
@@ -178,6 +84,7 @@ impl Server {
             }
         };
         eprintln!("got req {req:?}");
+        /*
         let mut msg_count = 0;
         let id = (req.topic, req.partition);
         loop {
@@ -218,6 +125,7 @@ impl Server {
                 }
             }
         }
+        */
         pb::ResponseHeader {
             error: pb::ErrorCode::None as i32,
             ..Default::default()
@@ -243,7 +151,8 @@ impl Server {
         // but it'll be kinda hard in terms of error handling. Besides, we partition the topics exactly as a way to parallelize IO,
         // It doesn't seem reasonable to drop the notion of partitions, because apart for parallelism they are also useful for providing ordering semantics.
 
-        let id = (req.topic, req.partition); // TODO: writes should be sharded between IO threads to ensure nobody is writing to partition logs concurrently 
+        /*
+        let id = (req.topic, req.partition); // TODO: writes should be sharded between IO threads to ensure nobody is writing to partition logs concurrently
         let f = if let Some(f) = self.partition_files.get(&id) {
             f
         } else {
@@ -331,8 +240,15 @@ impl Server {
                 ..Default::default()
             },
         }
-    }
 
+        */
+        pb::ResponseHeader {
+            error: pb::ErrorCode::None as i32,
+            error_description: None,
+            response: None,
+        }
+    }
+    /*
     async fn read_message_at_offset(
         &self,
         id: &TopicPartition,
@@ -364,4 +280,5 @@ impl Server {
                 e: "reading partition",
             })
     }
+    */
 }
