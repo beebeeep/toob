@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rxc = rx.clone();
         let t = builder
             .spawn(async move || {
-                let server = node::io::Server::new(thread_parts, rxc)
+                let mut server = node::io::Server::new(thread_parts, rxc)
                     .await
                     .expect("starting IO thread");
                 server.serve().await.expect("IO thread running");

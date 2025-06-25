@@ -1,4 +1,4 @@
-use std::{fmt::Display, str::FromStr};
+use std::fmt::Display;
 
 use error::Error;
 
@@ -10,7 +10,7 @@ pub mod pb {
 }
 
 pub enum IORequest {
-    Put { tp: TopicPartition, data: Vec<u8> },
+    Put { tp: TopicPartition, msg: Vec<u8> },
     Get { tp: TopicPartition, offset: u64 },
 }
 

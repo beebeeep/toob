@@ -1,4 +1,3 @@
-use async_channel::RecvError;
 use snafu::prelude::*;
 
 use crate::pb;

@@ -1,15 +1,15 @@
 use async_channel::Sender;
-use snafu::{IntoError, ResultExt};
-use std::{fmt::Debug, time::Duration};
+use snafu::ResultExt;
+use std::time::Duration;
 
 use crate::{
-    IOMessage, TopicPartition,
+    IOMessage, IOReply, IORequest, TopicPartition,
     error::{self, Error},
     pb, util,
 };
 use bytes::{Buf, BytesMut};
 use futures_lite::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use glommio::{io::ReadResult, net::TcpStream, timer::sleep};
+use glommio::{net::TcpStream, timer::sleep};
 use prost::Message;
 use std::collections::HashMap;
 
@@ -84,31 +84,64 @@ impl Server {
             }
         };
         eprintln!("got req {req:?}");
-        /*
         let mut msg_count = 0;
-        let id = (req.topic, req.partition);
+        let tp = TopicPartition::new(&req.topic, &req.partition);
         loop {
-            let msg = match self
-                .read_message_at_offset(&id, req.start_offset + msg_count)
-                .await
-            {
-                Ok(msg) => msg,
-                Err(Error::OffsetNotFound) => {
-                    // no messages, wait a bit
-                    // TODO: this shall be signalled somehow from producer?
-                    sleep(Duration::from_millis(50)).await;
-                    continue;
+            let tp = tp.clone();
+            let (tx, rx) = oneshot::channel();
+            let io_worker = match self.io_chans.get(&tp) {
+                Some(v) => v,
+                None => {
+                    return pb::ResponseHeader {
+                        error: pb::ErrorCode::TopicPartitionNotFound as i32,
+                        error_description: Some(format!(
+                            "topic {} partition {} not found",
+                            tp.topic, tp.partition
+                        )),
+                        ..Default::default()
+                    };
                 }
+            };
+            let offset = req.start_offset + msg_count;
+            let msg = match io_worker.send((IORequest::Get { tp, offset }, tx)).await {
+                Ok(_) => match rx.await {
+                    Ok(resp) => match resp {
+                        Ok(IOReply::Get(v)) => v,
+                        Ok(_) => {
+                            panic!("unexpected reply from IO worker")
+                        }
+                        Err(Error::OffsetNotFound) => {
+                            // no messages, wait a bit
+                            // TODO: this shall be signalled somehow from producer?
+                            sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
+                        Err(e) => {
+                            return pb::ResponseHeader {
+                                error: pb::ErrorCode::FetchError as i32,
+                                error_description: Some(e.to_string()),
+                                ..Default::default()
+                            };
+                        }
+                    },
+                    Err(e) => {
+                        return pb::ResponseHeader {
+                            error: pb::ErrorCode::FetchError as i32,
+                            error_description: Some(e.to_string()),
+                            ..Default::default()
+                        };
+                    }
+                },
                 Err(e) => {
                     return pb::ResponseHeader {
-                        error: pb::ErrorCode::ProduceError as i32,
+                        error: pb::ErrorCode::FetchError as i32,
                         error_description: Some(e.to_string()),
-                        response: None,
+                        ..Default::default()
                     };
                 }
             };
 
-            if let Err(e) = stream.write(msg.as_ref()).await.context(error::IO {
+            if let Err(e) = stream.write(&msg).await.context(error::IO {
                 e: "writing message to stream",
             }) {
                 return pb::ResponseHeader {
@@ -125,7 +158,6 @@ impl Server {
                 }
             }
         }
-        */
         pb::ResponseHeader {
             error: pb::ErrorCode::None as i32,
             ..Default::default()
@@ -146,35 +178,30 @@ impl Server {
             };
         };
         eprintln!("got req {req:?}");
-        // TODO: there should be single worker per each partition accepting writes via mpsc channel.
-        // Perhaps it is possible to preallocate disk space in log file and have a dispatcher reserving ranges in file so that we can write to the partition concurrently,
-        // but it'll be kinda hard in terms of error handling. Besides, we partition the topics exactly as a way to parallelize IO,
-        // It doesn't seem reasonable to drop the notion of partitions, because apart for parallelism they are also useful for providing ordering semantics.
+        let tp = TopicPartition::new(&req.topic, &req.partition);
 
-        /*
-        let id = (req.topic, req.partition); // TODO: writes should be sharded between IO threads to ensure nobody is writing to partition logs concurrently
-        let f = if let Some(f) = self.partition_files.get(&id) {
-            f
-        } else {
-            return pb::ResponseHeader {
-                error: pb::ErrorCode::TopicPartitionNotFound as i32,
-                error_description: Some(format!("topic {} partition {} not found", id.0, id.1)),
-                ..Default::default()
-            };
-        };
-        let mut file_offset = match f.file_size().await {
-            Ok(v) => v,
-            Err(e) => {
+        let io_worker = match self.io_chans.get(&tp) {
+            Some(v) => v,
+            None => {
                 return pb::ResponseHeader {
-                    error: pb::ErrorCode::ProduceError as i32,
-                    error_description: Some(format!("getting partition size: {e}")),
+                    error: pb::ErrorCode::TopicPartitionNotFound as i32,
+                    error_description: Some(format!(
+                        "topic {} partition {} not found",
+                        tp.topic, tp.partition
+                    )),
                     ..Default::default()
                 };
             }
         };
-        let first_offset = file_offset;
 
-        let mut offsets = Vec::with_capacity(req.batch_size as usize);
+        if req.batch_size == 0 {
+            return pb::ResponseHeader {
+                error: pb::ErrorCode::None as i32,
+                ..Default::default()
+            };
+        }
+
+        let mut first_offset = None;
         for _ in 0..req.batch_size {
             let msg = match util::read_delimited_message(&mut stream).await {
                 Ok(v) => v,
@@ -186,49 +213,52 @@ impl Server {
                     };
                 }
             };
-            let msg_len = msg.len();
             eprintln!("got message: {:?}", msg);
-            if let Err(e) = f.write_at(msg, 0).await {
-                return pb::ResponseHeader {
-                    error: pb::ErrorCode::ProduceError as i32,
-                    error_description: Some(format!("writing message to partition: {e}")),
-                    ..Default::default()
-                };
-            }
-            offsets.push(MessageMeta {
-                file_offset,
-                size: msg_len,
-            });
-            file_offset += msg_len as u64;
-        }
 
-        if let Err(e) = f.fdatasync().await {
-            return pb::ResponseHeader {
-                error: pb::ErrorCode::ProduceError as i32,
-                error_description: Some(format!("doing fsync: {e}")),
-                ..Default::default()
+            let (tx, rx) = oneshot::channel();
+            let tp = tp.clone();
+            let offset = match io_worker.send((IORequest::Put { tp, msg }, tx)).await {
+                Ok(_) => match rx.await {
+                    Ok(resp) => match resp {
+                        Ok(IOReply::Put(offset)) => offset,
+                        Ok(_) => {
+                            panic!("unexpected reply from IO worker")
+                        }
+                        Err(e) => {
+                            return pb::ResponseHeader {
+                                error: pb::ErrorCode::ProduceError as i32,
+                                error_description: Some(e.to_string()),
+                                ..Default::default()
+                            };
+                        }
+                    },
+                    Err(e) => {
+                        return pb::ResponseHeader {
+                            error: pb::ErrorCode::ProduceError as i32,
+                            error_description: Some(e.to_string()),
+                            ..Default::default()
+                        };
+                    }
+                },
+                Err(e) => {
+                    return pb::ResponseHeader {
+                        error: pb::ErrorCode::ProduceError as i32,
+                        error_description: Some(e.to_string()),
+                        ..Default::default()
+                    };
+                }
             };
-        }
-
-        // update index
-        // nb: we don't do any awaits here, so we won't be interrupted
-        // by new request that will be cloning self.
-        {
-            let mut offset_index = self.offset_index.borrow_mut();
-            let index = offset_index.get_mut(&id).unwrap();
-            let next = index.last_entry().map_or(0, |x| *x.key() + 1);
-            offsets.into_iter().enumerate().for_each(|(i, o)| {
-                index.insert(next + i as u64, o);
-            });
-
-            eprintln!("updated index:");
-            for (k, v) in index {
-                eprintln!("{k} => {v:?}");
+            if first_offset.is_none() {
+                first_offset = Some(offset);
             }
         }
 
         let mut buf = Vec::with_capacity(8);
-        match (pb::ProduceResponse { first_offset }).encode_length_delimited(&mut buf) {
+        match (pb::ProduceResponse {
+            first_offset: first_offset.unwrap(),
+        })
+        .encode_length_delimited(&mut buf)
+        {
             Ok(_) => pb::ResponseHeader {
                 error: pb::ErrorCode::None as i32,
                 error_description: None,
@@ -240,45 +270,5 @@ impl Server {
                 ..Default::default()
             },
         }
-
-        */
-        pb::ResponseHeader {
-            error: pb::ErrorCode::None as i32,
-            error_description: None,
-            response: None,
-        }
     }
-    /*
-    async fn read_message_at_offset(
-        &self,
-        id: &TopicPartition,
-        offset: u64,
-    ) -> Result<ReadResult, Error> {
-        let meta = {
-            let index = self.offset_index.borrow();
-            *index
-                .get(id)
-                .ok_or(Error::TopicPartitionNotFound {
-                    // TODO: use Option instead of returning error here mb?
-                    topic: id.0.clone(),
-                    partition: id.1,
-                })?
-                .get(&offset)
-                .ok_or(Error::OffsetNotFound)?
-        };
-        let f = self
-            .partition_files
-            .get(id)
-            .ok_or(Error::TopicPartitionNotFound {
-                topic: id.0.clone(),
-                partition: id.1,
-            })?;
-
-        f.read_at(meta.file_offset, meta.size as usize)
-            .await
-            .context(error::Glommio {
-                e: "reading partition",
-            })
-    }
-    */
 }

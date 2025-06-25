@@ -6,9 +6,9 @@ use crate::{
     IOMessage, IOReply, IORequest, TopicPartition,
     error::{self, Error},
 };
-use glommio::io::{BufferedFile, OpenOptions};
+use glommio::io::{BufferedFile, OpenOptions, ReadResult};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct MessageMeta {
     file_offset: u64,
     size: usize,
@@ -79,21 +79,94 @@ impl Server {
         })
     }
 
-    pub async fn serve(&self) -> Result<(), Error> {
-        match self.tx.recv().await.context(error::IORecv)? {
-            (IORequest::Put { tp, data }, resp) => {
-                eprintln!("got PUT to {tp}, {} bytes", data.len());
-                if let Err(e) = resp.send(Ok(IOReply::Put(0))) {
-                    eprintln!("error sending PUT reply: {e}");
+    pub async fn serve(&mut self) -> Result<(), Error> {
+        loop {
+            match self.tx.recv().await.context(error::IORecv)? {
+                (IORequest::Put { tp, msg }, resp) => {
+                    eprintln!("got PUT to {tp}, {} bytes", msg.len());
+                    let r = self.write_message(&tp, msg).await.map(|v| IOReply::Put(v));
+                    if let Err(e) = resp.send(r) {
+                        eprintln!("error sending PUT reply: {e}");
+                    }
                 }
-            }
-            (IORequest::Get { tp, offset }, resp) => {
-                eprintln!("got GET at {tp}/{offset}");
-                if let Err(e) = resp.send(Ok(IOReply::Get(Vec::new()))) {
-                    eprintln!("error sending GET reply: {e}");
+                (IORequest::Get { tp, offset }, resp) => {
+                    eprintln!("got GET at {tp}@{offset}");
+                    let r = self
+                        .fetch_message(&tp, &offset)
+                        .await
+                        // I really don't like that we have to copy ReadResult into Vec inside hot path,
+                        // but I failed to find better solution on how to pass it to network thread
+                        .map(|v| IOReply::Get(v.to_vec()));
+                    if let Err(e) = resp.send(r) {
+                        eprintln!("error sending GET reply: {e}");
+                    }
                 }
             }
         }
-        Ok(())
+    }
+
+    async fn write_message(&mut self, tp: &TopicPartition, message: Vec<u8>) -> Result<u64, Error> {
+        let msg_len = message.len();
+        let idx = self
+            .offset_index
+            .get_mut(tp)
+            .ok_or(Error::TopicPartitionNotFound {
+                topic: tp.topic.clone(),
+                partition: tp.partition,
+            })?;
+
+        let (last_offset, last_meta) = match idx.last_key_value() {
+            Some((k, v)) => (Some(k), Some(v)),
+            None => (None, None),
+        };
+
+        // write message to partition file (it is opened in append mode)
+        let f = self
+            .partition_files
+            .get(tp)
+            .expect("getting partition file");
+        f.write_at(message, 0).await.context(error::Glommio {
+            e: "writing to partition file",
+        })?;
+
+        // update offset indexes
+        let (message_offset, message_meta) = (
+            last_offset.map_or(0, |x| x + 1),
+            MessageMeta {
+                file_offset: last_meta.map_or(0, |x| x.file_offset + x.size as u64),
+                size: msg_len,
+            },
+        );
+        idx.insert(message_offset, message_meta);
+
+        // TODO: signal consumers that new message is available?
+
+        Ok(message_offset)
+    }
+
+    async fn fetch_message(&self, tp: &TopicPartition, offset: &u64) -> Result<ReadResult, Error> {
+        let meta = {
+            self.offset_index
+                .get(tp)
+                .ok_or(Error::TopicPartitionNotFound {
+                    topic: tp.topic.clone(),
+                    partition: tp.partition,
+                })?
+                .get(&offset)
+                .ok_or(Error::OffsetNotFound)? // TODO: if offset is not YET found, mb we can wait here until it'll be written?
+        };
+        let f = self
+            .partition_files
+            .get(tp)
+            .ok_or(Error::TopicPartitionNotFound {
+                topic: tp.topic.clone(),
+                partition: tp.partition,
+            })?;
+
+        f.read_at(meta.file_offset, meta.size as usize)
+            .await
+            .context(error::Glommio {
+                e: "reading partition",
+            })
     }
 }
