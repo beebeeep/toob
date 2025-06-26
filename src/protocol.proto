@@ -66,7 +66,7 @@ message ConsumeRequest {
 
 // 2. server replies with ResponseHeader containing ConsumeResponse:
 message ConsumeResponse {
-  uint64 first_offset = 1;  // offset of first message in the batch
+  uint64 first_offset = 1;  // offset of first message in the batch (may differ from start_offset because of retention)
 }
 
 // 3. Server now streams messages, up to MaxMessages, or infinitely if MaxMessages is not specified

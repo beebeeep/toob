@@ -103,18 +103,13 @@ impl Server {
                 }
             };
             let offset = req.start_offset + msg_count;
+            // TODO: send pb::ConsumeResponse before sending messages
             let msg = match io_worker.send((IORequest::Get { tp, offset }, tx)).await {
                 Ok(_) => match rx.await {
                     Ok(resp) => match resp {
                         Ok(IOReply::Get(v)) => v,
                         Ok(_) => {
                             panic!("unexpected reply from IO worker")
-                        }
-                        Err(Error::OffsetNotFound) => {
-                            // no messages, wait a bit
-                            // TODO: this shall be signalled somehow from producer?
-                            sleep(Duration::from_millis(50)).await;
-                            continue;
                         }
                         Err(e) => {
                             return pb::ResponseHeader {

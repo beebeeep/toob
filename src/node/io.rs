@@ -1,4 +1,5 @@
-use async_channel::Receiver;
+use async_broadcast as ab;
+use async_channel as ac;
 use snafu::ResultExt;
 use std::{
     cell::RefCell,
@@ -23,21 +24,36 @@ struct MessageMeta {
 
 #[derive(Clone)]
 pub struct Server {
+    /// Mapping of topic-partitions to partition file opened in APPEND mode
     partition_files: Rc<HashMap<TopicPartition, BufferedFile>>,
+
+    /// Broadcast channels that is used by consumers to wait for new message to appear in partition.
+    /// Each write to partition emits message to relevant channel.
+    partition_signals: Rc<HashMap<TopicPartition, (ab::Sender<i32>, ab::Receiver<i32>)>>,
+
+    /// Offset indexes map logical message offset to its metadata - message size and physical offset in partition file
     offset_index: Rc<RefCell<HashMap<TopicPartition, BTreeMap<u64, MessageMeta>>>>,
-    tx: Receiver<IOMessage>,
+
+    /// Channel for receiving requests from network threads
+    tx: ac::Receiver<IOMessage>,
 }
 
 impl Server {
     pub async fn new(
         partitions: Vec<(TopicPartition, String)>,
-        tx: Receiver<IOMessage>,
+        tx: ac::Receiver<IOMessage>,
     ) -> Result<Self, Error> {
         let mut partition_files = HashMap::new();
         let mut offset_index = HashMap::new();
+        let mut partition_signals = HashMap::new();
 
         // open all partition files and scan them to build offset index mapping logical offset to offset in file
         for (partition, path) in partitions {
+            let (mut sig_tx, sig_rx) = ab::broadcast(1);
+            sig_tx.set_await_active(false);
+            sig_tx.set_overflow(true);
+            partition_signals.insert(partition.clone(), (sig_tx, sig_rx));
+
             let partition_file = OpenOptions::new()
                 .write(true)
                 .read(true)
@@ -82,6 +98,7 @@ impl Server {
 
         Ok(Self {
             partition_files: Rc::new(partition_files),
+            partition_signals: Rc::new(partition_signals),
             offset_index: Rc::new(RefCell::new(offset_index)),
             tx,
         })
@@ -153,23 +170,34 @@ impl Server {
             },
         );
         idx.insert(message_offset, message_meta);
+        eprintln!(
+            "wrote message {msg_len} to {tp} at offset {message_offset} with physical offset {} ",
+            message_meta.file_offset
+        );
 
-        // TODO: signal consumers that new message is available?
+        // broadcast any potential consumers that we just wrote a new message to partition
+        let (tx, _) = self.partition_signals.get(tp).unwrap();
+        let _ = tx.clone().broadcast(1).await;
 
         Ok(message_offset)
     }
 
     async fn fetch_message(&self, tp: &TopicPartition, offset: &u64) -> Result<ReadResult, Error> {
         let meta = {
-            let idx = self.offset_index.borrow();
-            idx.get(tp)
-                .ok_or(Error::TopicPartitionNotFound {
-                    topic: tp.topic.clone(),
-                    partition: tp.partition,
-                })?
-                .get(&offset)
-                .ok_or(Error::OffsetNotFound)? // TODO: if offset is not YET found, mb we can wait here until it'll be written?
-                .clone()
+            match {
+                // ensure that scope of idx is small so we don't hold offset_index for more than necessary
+                let idx = self.offset_index.borrow();
+                idx.get(tp)
+                    .ok_or(Error::TopicPartitionNotFound {
+                        topic: tp.topic.clone(),
+                        partition: tp.partition,
+                    })?
+                    .get(&offset)
+                    .map(|x| x.clone())
+            } {
+                Some(m) => m,
+                None => self.wait_for_message(tp, offset).await,
+            }
         };
         let f = self
             .partition_files
@@ -184,5 +212,18 @@ impl Server {
             .context(error::Glommio {
                 e: "reading partition",
             })
+    }
+
+    async fn wait_for_message(&self, tp: &TopicPartition, offset: &u64) -> MessageMeta {
+        // offset index doesn't have requested partition, we will wait for some producer to write a new message and signal us
+        let (_, signal) = self.partition_signals.get(tp).unwrap();
+        let mut signal = signal.clone();
+        loop {
+            let _ = signal.recv().await;
+            let idx = self.offset_index.borrow();
+            if let Some(m) = idx.get(tp).unwrap().get(&offset) {
+                return m.clone();
+            }
+        }
     }
 }
