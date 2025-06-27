@@ -11,9 +11,6 @@ pub enum Error {
     )]
     TopicPartitionNotFound { topic: String, partition: u32 },
 
-    #[snafu(display("invalid request"), context(suffix(false)))]
-    InvalidRequest,
-
     #[snafu(display("offset not found"), context(suffix(false)))]
     OffsetNotFound,
 
@@ -40,10 +37,35 @@ pub enum Error {
 
     #[snafu(display("IO thread request"), context(suffix(false)))]
     IORecv { source: async_channel::RecvError },
+
+    #[snafu(
+        display("Server request error: {e:?}: {desc:?}"),
+        context(suffix(false))
+    )]
+    ServerResponse {
+        e: pb::ErrorCode,
+        desc: Option<String>,
+    },
+
+    #[snafu(display("{e}"), context(suffix(false)))]
+    Other { e: String },
 }
 
 impl Into<pb::ErrorCode> for Error {
     fn into(self) -> pb::ErrorCode {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    pub fn test_errors() {
+        let e: Result<(), Error> = Other { e: "foo" }.fail();
+        let e = e.expect_err("should be err");
+        assert_eq!(format!("{e}"), "foo");
     }
 }

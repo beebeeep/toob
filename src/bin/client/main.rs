@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
 };
-use toob::{pb, util};
+use toob::{client, pb, util};
 
 fn main() {
     let matches = Command::new("toob client")
@@ -36,7 +36,7 @@ fn main() {
 }
 
 async fn start_producer() {
-    let mut stream = TcpStream::connect("localhost:8137").await.unwrap();
+    let mut client = client::Client::connect("localhost:8137").await.unwrap();
     let input = std::io::stdin();
     loop {
         let mut line = String::new();
@@ -44,33 +44,11 @@ async fn start_producer() {
             break;
         }
         println!("read {} bytes", line.len());
-        let req = pb::ProduceRequest {
-            topic: "test_topic".to_string(),
-            partition: 0,
-            batch_size: 1,
-        };
-        let mut buf = BytesMut::with_capacity(128);
-        req.encode_length_delimited(&mut buf).unwrap();
-        let header = pb::RequestHeader {
-            request_id: pb::Request::Produce as i32,
-            request: buf.to_vec(),
-        };
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        let msg = pb::Message {
-            timestamp: Some(prost_types::Timestamp {
-                seconds: ts.as_secs() as i64,
-                nanos: ts.subsec_nanos() as i32,
-            }),
-            metadata: HashMap::new(),
-            key: None,
-            value: line.trim().into(),
-        };
-
-        buf.truncate(0);
-        header.encode_length_delimited(&mut buf).unwrap();
-        eprintln!("wrote header, len {} bytes: {:?}", buf.len(), buf);
-        msg.encode_length_delimited(&mut buf).unwrap();
-        stream.write(&buf).await.unwrap();
+        let offset = client
+            .produce("test_topic", vec![line.encode_to_vec()])
+            .await
+            .unwrap();
+        println!("wrote message to {offset}");
     }
 }
 
