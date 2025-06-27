@@ -4,13 +4,18 @@ use futures_lite::{AsyncRead, AsyncReadExt};
 use prost::Message;
 use snafu::ResultExt;
 
+/// maximum length of varint encoding message size, 4 bytes are enough to encode 256Mi - 1
+const MAX_MESSAGE_LEN: usize = 4;
+
 /// Reads length of message (encoded as varint), then message itself. Returned buffer includes original length header.
 pub async fn read_delimited_message(
     mut stream: impl AsyncRead + Unpin,
 ) -> Result<Vec<u8>, error::Error> {
     let mut buf = Vec::with_capacity(512);
     // each message is prepended with varint (from 1 to 10 bytes) encoding its length
-    buf.resize(10, 0);
+    // we are reading only up to MAX_MESSAGE_LEN bytes to simplify handling of really short messages
+    // TODO get rid of this limit maybe?
+    buf.resize(MAX_MESSAGE_LEN, 0);
     stream.read_exact(&mut buf).await.context(error::IO {
         e: "reading message length",
     })?;
@@ -19,11 +24,14 @@ pub async fn read_delimited_message(
     })?;
     let delim = prost::length_delimiter_len(len);
 
-    // we already read 10 bytes, read the rest
+    // we already read MASX_MESSAGE_LEN bytes, read the rest
     buf.resize(len + delim, 0);
-    stream.read_exact(&mut buf[10..]).await.context(error::IO {
-        e: "reading message",
-    })?;
+    stream
+        .read_exact(&mut buf[MAX_MESSAGE_LEN..])
+        .await
+        .context(error::IO {
+            e: "reading message",
+        })?;
     Ok(buf)
 }
 
@@ -35,7 +43,7 @@ pub fn encode_response(
     let response = match msg {
         None => None,
         Some(msg) => {
-            let mut buf = Vec::with_capacity(1); // todo change to 32
+            let mut buf = Vec::with_capacity(32);
             msg.encode_length_delimited(&mut buf)
                 .context(error::Encode {
                     e: "encoding response message",

@@ -85,7 +85,6 @@ impl Client {
             })?;
             eprintln!("sent message");
         }
-        eprintln!("sent batch");
 
         let resp = read_response_header(&mut self.stream)
             .await?
@@ -106,6 +105,7 @@ impl Client {
         topic: &str,
         partition: u32,
         start_offset: u64,
+        max_messages: Option<u64>,
     ) -> Result<impl Stream<Item = Result<(u64, pb::Message), Error>>, Error> {
         let req = encode_request(
             pb::Request::Consume,
@@ -113,7 +113,7 @@ impl Client {
                 topic: String::from(topic),
                 partition,
                 start_offset,
-                max_messages: None,
+                max_messages,
             }),
         )?;
 
@@ -130,13 +130,18 @@ impl Client {
             pb::ConsumeResponse::decode_length_delimited(resp.as_ref()).context(error::Decode {
                 e: "decoding response",
             })?;
+
         let mut offset = resp.first_offset;
+        let mut count = 0;
 
         Ok(try_stream! {
-            offset = offset + 1;
-            let msg = read_delimited_message(&mut self.stream).await?;
-            let msg = pb::Message::decode_length_delimited(msg.as_ref()).context(error::Decode{e: "decoding message"})?;
-            yield (offset - 1, msg)
+            while max_messages.is_none_or(|max| max > count) {
+                offset = offset + 1;
+                count = count + 1;
+                let msg = read_delimited_message(&mut self.stream).await?;
+                let msg = pb::Message::decode_length_delimited(msg.as_ref()).context(error::Decode{e: "decoding message"})?;
+                yield (offset - 1, msg)
+            }
         })
     }
 }

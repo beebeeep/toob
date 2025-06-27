@@ -33,7 +33,6 @@ impl Server {
             stream.write(buf.as_ref()).await.context(error::IO {
                 e: "sending response header",
             })?;
-            eprintln!("processed request, error was {:?}", resp.error)
         }
         Ok(())
     }
@@ -236,7 +235,6 @@ impl Server {
                     });
                 }
             };
-            eprintln!("got message: {:?}", msg);
 
             let (tx, rx) = oneshot::channel();
             let tp = tp.clone();
@@ -275,8 +273,6 @@ impl Server {
                 first_offset = Some(offset);
             }
         }
-
-        eprintln!("wrote batch");
 
         let mut buf = Vec::with_capacity(8);
         match (pb::ProduceResponse {
