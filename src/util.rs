@@ -35,7 +35,7 @@ pub async fn read_delimited_message(
     Ok(buf)
 }
 
-pub fn encode_response(
+pub fn encode_response_header(
     error: pb::ErrorCode,
     error_description: Option<&str>,
     msg: Option<impl prost::Message>,
@@ -66,7 +66,7 @@ pub fn encode_response(
     Ok(buf)
 }
 
-pub fn encode_request(
+pub fn encode_request_header(
     request_id: pb::Request,
     req: Option<impl prost::Message>,
 ) -> Result<Vec<u8>, Error> {
@@ -92,9 +92,9 @@ pub fn encode_request(
     Ok(hdr_buf)
 }
 
-pub async fn read_response_header(
+pub async fn read_response_header<T: prost::Message + Default>(
     mut stream: impl AsyncRead + Unpin,
-) -> Result<Option<Vec<u8>>, error::Error> {
+) -> Result<Option<T>, error::Error> {
     let resp = pb::ResponseHeader::decode_length_delimited(
         read_delimited_message(&mut stream).await?.as_ref(),
     )
@@ -102,16 +102,28 @@ pub async fn read_response_header(
         e: "decoding response",
     })?;
 
-    match pb::ErrorCode::try_from(resp.error) {
-        Ok(pb::ErrorCode::None) => Ok(resp.response),
-        Ok(e) => error::ServerResponse {
-            e,
-            desc: resp.error_description,
+    let resp = match pb::ErrorCode::try_from(resp.error) {
+        Ok(pb::ErrorCode::None) => resp.response,
+        Ok(e) => {
+            return error::ServerResponse {
+                e,
+                desc: resp.error_description,
+            }
+            .fail();
         }
-        .fail(),
-        Err(_) => error::Other {
-            e: format!("unknown server error code: {}", resp.error),
+        Err(_) => {
+            return error::Other {
+                e: format!("unknown server error code: {}", resp.error),
+            }
+            .fail();
         }
-        .fail(),
+    };
+    match resp {
+        Some(resp) => Ok(Some(T::decode_length_delimited(resp.as_ref()).context(
+            error::Decode {
+                e: "decoding response",
+            },
+        )?)),
+        None => Ok(None),
     }
 }

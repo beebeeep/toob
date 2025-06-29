@@ -5,13 +5,13 @@ use crate::{
     IOMessage, IOReply, IORequest, TopicPartition,
     error::{self, Error},
     pb,
-    util::{self, encode_response},
+    util::{self, encode_response_header},
 };
 use bytes::{Buf, BytesMut};
 use futures_lite::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use glommio::net::TcpStream;
 use prost::Message;
-use std::collections::HashMap;
+use std::{ascii::AsciiExt, collections::HashMap};
 
 #[derive(Clone)]
 pub struct Server {
@@ -58,12 +58,50 @@ impl Server {
         match header.request_id.try_into() {
             Ok(pb::Request::Consume) => self.req_consume(header.request.as_ref(), stream).await,
             Ok(pb::Request::Produce) => self.req_produce(header.request.as_ref(), stream).await,
+            Ok(pb::Request::Metadata) => self.req_metadata(header.request.as_ref()).await,
             Ok(pb::Request::Noop) => Some(pb::ResponseHeader {
                 error: pb::ErrorCode::None as i32,
                 ..Default::default()
             }),
             Err(_) => Some(pb::ResponseHeader {
                 error: pb::ErrorCode::InvalidRequest as i32,
+                ..Default::default()
+            }),
+        }
+    }
+
+    async fn req_metadata(&self, req: impl Buf) -> Option<pb::ResponseHeader> {
+        let req = match pb::MetadataRequest::decode_length_delimited(req) {
+            Ok(v) => v,
+            Err(e) => {
+                return Some(pb::ResponseHeader {
+                    error: pb::ErrorCode::InvalidRequest as i32,
+                    error_description: Some(e.to_string()),
+                    response: None,
+                });
+            }
+        };
+        let partitions = self
+            .io_chans
+            .keys()
+            .filter(|tp| tp.topic == req.topic)
+            .count();
+
+        eprintln!("found {partitions} partitions");
+
+        let mut buf = Vec::with_capacity(8);
+        let resp = pb::MetadataResponse {
+            partitions: partitions as u32,
+        };
+        match resp.encode_length_delimited(&mut buf) {
+            Ok(_) => Some(pb::ResponseHeader {
+                error: pb::ErrorCode::None as i32,
+                error_description: None,
+                response: Some(buf),
+            }),
+            Err(e) => Some(pb::ResponseHeader {
+                error: pb::ErrorCode::GenericError as i32,
+                error_description: Some(e.to_string()),
                 ..Default::default()
             }),
         }
@@ -139,7 +177,7 @@ impl Server {
 
             if !consume_resp_send {
                 consume_resp_send = true;
-                match encode_response(
+                match encode_response_header(
                     pb::ErrorCode::None,
                     None,
                     Some(pb::ConsumeResponse {

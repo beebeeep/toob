@@ -39,7 +39,6 @@ async fn start_producer() {
         if input.read_line(&mut line).unwrap() == 0 {
             break;
         }
-        println!("read {} bytes", line.len());
         let offset = client
             .produce("test_topic", vec![line.encode_to_vec()])
             .await

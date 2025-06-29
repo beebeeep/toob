@@ -7,6 +7,7 @@ enum Request {
   Noop = 0;
   Produce = 1;
   Consume = 2;
+  Metadata = 3;
 }
 
 enum ErrorCode {
@@ -15,6 +16,7 @@ enum ErrorCode {
   TopicPartitionNotFound = 2;
   ProduceError = 3;
   FetchError = 4;
+  GenericError = 5;
 }
 
 message Message {
@@ -69,3 +71,15 @@ message ConsumeResponse {
 }
 
 // 3. Server now streams messages, up to MaxMessages, or infinitely if MaxMessages is not specified
+
+
+// == Metadata ==
+// 1. client sends RequestHeader containining MetadataRequest:
+message MetadataRequest {
+  string topic = 1;
+}
+
+// 2. server replies with RequestResponse containing MetadataResponse:
+message MetadataResponse {
+  uint32 partitions = 1; // numer of partitions
+}
