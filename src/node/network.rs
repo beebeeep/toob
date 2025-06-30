@@ -11,7 +11,7 @@ use bytes::{Buf, BytesMut};
 use futures_lite::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use glommio::net::TcpStream;
 use prost::Message;
-use std::{ascii::AsciiExt, collections::HashMap};
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct Server {

@@ -77,11 +77,12 @@ impl Client {
         let mut buf = BytesMut::with_capacity(512);
         let partitions = self.metadata(topic).await?;
 
+        // TODO: implement partitioner that would distribute batch across partitions
         let req = encode_request_header(
             pb::Request::Produce,
             Some(pb::ProduceRequest {
                 topic: topic.to_string(),
-                partition: rand::rng().random_range(0..partitions), // TODO: partitioners
+                partition: rand::rng().random_range(0..partitions),
                 batch_size: messages.len() as u32,
             }),
         )?;
@@ -96,7 +97,7 @@ impl Client {
                 seconds: ts.as_secs() as i64,
                 nanos: ts.as_nanos() as i32,
             }),
-            key: None,
+            key: None, // TODO: message type encapsulating key and value
             value: msg,
             metadata: HashMap::new(),
         });
